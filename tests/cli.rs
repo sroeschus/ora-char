@@ -266,7 +266,7 @@ fn reverse_errors() {
     );
     fails(
         &["-r", r"\x80"],
-        "byte 1 (0x80) is not ASCII, only ASCII data is supported",
+        r"escape sequence '\x80' at character 1 is not ASCII, only ASCII data is supported",
     );
 }
 
@@ -391,7 +391,12 @@ fn reverse_more_errors() {
     }
     fails(
         &["-r", r"AB\xFF"],
-        "byte 3 (0xFF) is not ASCII, only ASCII data is supported",
+        r"escape sequence '\xFF' at character 3 is not ASCII, only ASCII data is supported",
+    );
+    // The position counts input characters, escapes included.
+    fails(
+        &["-r", r"abc\t\x41\x80"],
+        r"escape sequence '\x80' at character 10 is not ASCII, only ASCII data is supported",
     );
     fails(
         &["-r", "--raw", ""],

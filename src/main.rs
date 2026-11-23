@@ -89,6 +89,12 @@ enum Error {
         pos: usize,
         ch: char,
     },
+    /// `-r` input has a `\\xNN` escape sequence `seq`, starting at 1-based
+    /// character position `pos`, for a byte that is not ASCII.
+    NotAsciiEscape {
+        pos: usize,
+        seq: String,
+    },
     /// `-r` input has an unknown or incomplete escape sequence.
     BadEscape(String),
     /// `-r` input is empty, which Oracle stores as NULL.
@@ -148,6 +154,11 @@ impl fmt::Display for Error {
             Error::NotAsciiChar { pos, ch } => write!(
                 f,
                 "character {pos} ('{ch}') is not ASCII, only ASCII data is supported"
+            ),
+            Error::NotAsciiEscape { pos, seq } => write!(
+                f,
+                "escape sequence '{seq}' at character {pos} is not ASCII, \
+                 only ASCII data is supported"
             ),
             Error::BadEscape(seq) => write!(
                 f,
@@ -489,9 +500,9 @@ fn encode_text(text: &str, raw: bool) -> Result<Vec<u8>, Error> {
                 let byte = u8::from_str_radix(&digits.iter().collect::<String>(), 16)
                     .map_err(|_| bad(4))?;
                 if !byte.is_ascii() {
-                    return Err(Error::NotAscii {
-                        pos: bytes.len() + 1,
-                        byte,
+                    return Err(Error::NotAsciiEscape {
+                        pos: i + 1,
+                        seq: chars[i..i + 4].iter().collect(),
                     });
                 }
                 (byte, 4)
@@ -1312,8 +1323,16 @@ mod tests {
         ] {
             assert_eq!(enc(text), Err(Error::BadEscape(seq.into())), "{text}");
         }
-        assert_eq!(enc(r"ab\x80"), Err(Error::NotAscii { pos: 3, byte: 0x80 }));
-        assert_eq!(enc(r"\xFF"), Err(Error::NotAscii { pos: 1, byte: 0xFF }));
+        let not_ascii = |pos, seq: &str| {
+            Err(Error::NotAsciiEscape {
+                pos,
+                seq: seq.into(),
+            })
+        };
+        assert_eq!(enc(r"ab\x80"), not_ascii(3, r"\x80"));
+        // The sequence is shown as typed.
+        assert_eq!(enc(r"\xFF"), not_ascii(1, r"\xFF"));
+        assert_eq!(enc(r"\xff"), not_ascii(1, r"\xff"));
     }
 
     #[test]
@@ -1378,7 +1397,13 @@ mod tests {
         assert_eq!(enc(r"\ä"), bad(r"\ä"));
         // The first problem is reported.
         assert_eq!(enc(r"\q\x80"), bad(r"\q"));
-        assert_eq!(enc(r"\x80\q"), Err(Error::NotAscii { pos: 1, byte: 0x80 }));
+        assert_eq!(
+            enc(r"\x80\q"),
+            Err(Error::NotAsciiEscape {
+                pos: 1,
+                seq: r"\x80".into()
+            })
+        );
         assert_eq!(enc(r"ä\q"), Err(Error::NotAsciiChar { pos: 1, ch: 'ä' }));
     }
 
@@ -1395,10 +1420,21 @@ mod tests {
         assert_eq!(enc("ab€"), Err(Error::NotAsciiChar { pos: 3, ch: '€' }));
         assert_eq!(enc("€ä"), Err(Error::NotAsciiChar { pos: 1, ch: '€' }));
         assert_eq!(enc("日本"), Err(Error::NotAsciiChar { pos: 1, ch: '日' }));
-        // A \xNN byte is reported by its position in the resulting bytes.
+        // A non-ASCII \xNN escape is reported by the input position where it
+        // starts, the same way, not by its position in the resulting bytes.
         assert_eq!(
             enc(r"\t\x41\x80"),
-            Err(Error::NotAscii { pos: 3, byte: 0x80 })
+            Err(Error::NotAsciiEscape {
+                pos: 7,
+                seq: r"\x80".into()
+            })
+        );
+        assert_eq!(
+            enc(r"abc\t\x41\x80"),
+            Err(Error::NotAsciiEscape {
+                pos: 10,
+                seq: r"\x80".into()
+            })
         );
         // With --raw the backslash is an ordinary character.
         assert_eq!(
@@ -1589,6 +1625,13 @@ mod tests {
             (
                 Error::NotAsciiChar { pos: 2, ch: 'ä' },
                 "character 2 ('ä') is not ASCII, only ASCII data is supported",
+            ),
+            (
+                Error::NotAsciiEscape {
+                    pos: 7,
+                    seq: r"\x80".into(),
+                },
+                r"escape sequence '\x80' at character 7 is not ASCII, only ASCII data is supported",
             ),
             (
                 Error::BadEscape(r"\q".into()),

@@ -222,8 +222,9 @@ $ ora-char -r -f dec Hello
 
 The escape sequences that the forward conversion prints (`\\`, `\n`, `\t`,
 `\r`, `\0`, `\xNN`, and `\"` from verbose output) are decoded, so its output
-converts back to the same bytes. Write a backslash as `\\`, or use `--raw` to
-take the text literally:
+converts back to the same bytes. This holds for the escaped output only: text
+printed with `--raw` must be converted back with `-r --raw`. Write a backslash
+as `\\`, or use `--raw` to take the text literally:
 
 ```sh
 $ ora-char -r 'a\tb'

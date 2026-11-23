@@ -213,6 +213,10 @@ are decoded, as is
 .B \e"
 from verbose output, so the output of the forward conversion converts back
 to the same bytes; any other backslash sequence is an error.
+This holds for the escaped output only: text printed with
+.B \-\-raw
+must be converted back with
+.BR "\-r \-\-raw" .
 Use
 .B \e\e
 for a backslash, or
@@ -230,8 +234,10 @@ the value, its length, the
 .B DUMP()
 output and the hex bytes are printed.
 .SH EXIT STATUS
-0 on success, 1 if the input cannot be parsed or is not ASCII, and 2 for
-invalid command line options.
+0 on success; 1 if the input cannot be parsed or is not ASCII, or with
+.B \-r
+if the text has an invalid escape sequence or is empty, or if the output
+cannot be written; and 2 for invalid command line options.
 .SH EXAMPLES
 .nf
 $ ora-char "Typ=1 Len=5: 72,101,108,108,111"
