@@ -93,8 +93,8 @@ for it.
 #### `DUMP(x)` output (decimal bytes)
 
 Paste the result of `SELECT DUMP(x) FROM ...` as is. The `Typ=n Len=n:`
-prefix is checked: the type must be `1` (`VARCHAR2`) or `96` (`CHAR`), and
-the number of bytes must match `Len`.
+prefix is checked: the type must be `1` (`VARCHAR2`) or `96` (`CHAR`), the
+number of bytes must match `Len`, and no field may appear more than once.
 
 ```sh
 $ ora-char "Typ=1 Len=11: 79,114,97,99,108,101,32,50,51,97,105"

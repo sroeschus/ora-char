@@ -41,7 +41,6 @@ impl fmt::Display for Format {
 struct Args {
     /// Oracle internal value, e.g. "Typ=1 Len=3: 97,98,99", "97,98,99", "616263", "0x616263"
     /// or "col 0: [ 3] 61 62 63"
-    #[arg(allow_hyphen_values = true)]
     input: String,
 
     /// Input format
@@ -67,6 +66,7 @@ enum Error {
         byte: u8,
     },
     BadHeader(String),
+    DuplicateField(String),
     UnsupportedType(u32),
     NationalCharset(Option<String>),
     BadPrefix(String),
@@ -94,6 +94,9 @@ impl fmt::Display for Error {
                 f,
                 "cannot parse DUMP header '{t}', expected e.g. 'Typ=1 Len=3: 97,98,99'"
             ),
+            Error::DuplicateField(key) => {
+                write!(f, "DUMP header has the field '{key}' more than once")
+            }
             Error::UnsupportedType(typ) => match type_name(*typ) {
                 Some(name) if *typ == 2 => {
                     write!(f, "Typ={typ} is {name}, not a character type, use ora-num")
@@ -158,10 +161,17 @@ fn parse_header(text: &str) -> Result<Header, Error> {
     let mut header = Header::default();
     for field in text.split_whitespace() {
         let (key, value) = field.split_once('=').ok_or_else(bad)?;
+        // Each field may appear only once, even with the same value.
+        fn set<T>(slot: &mut Option<T>, key: &str, value: T) -> Result<(), Error> {
+            match slot.replace(value) {
+                Some(_) => Err(Error::DuplicateField(key.to_string())),
+                None => Ok(()),
+            }
+        }
         match key {
-            "Typ" => header.typ = Some(value.parse().map_err(|_| bad())?),
-            "Len" => header.len = Some(value.parse().map_err(|_| bad())?),
-            "CharacterSet" => header.charset = Some(value.to_string()),
+            "Typ" => set(&mut header.typ, key, value.parse().map_err(|_| bad())?)?,
+            "Len" => set(&mut header.len, key, value.parse().map_err(|_| bad())?)?,
+            "CharacterSet" => set(&mut header.charset, key, value.to_string())?,
             _ => return Err(bad()),
         }
     }
@@ -253,7 +263,10 @@ fn parse_input(input: &str, format: Format) -> Result<Parsed, Error> {
     let (bytes, format, alternative) = match (parse_tokens(&tokens, chosen), other) {
         // Prefer the other format if only it gives plausible text, e.g.
         // "Typ=1 Len=2: 20,41" is " A" in hex, but control characters in decimal.
-        (Ok(b), Some((o, alt))) if !plausible(&b) && plausible(&alt) => (alt, o, None),
+        // Non-ASCII bytes are reported instead: "80" is 0x80, not "P".
+        (Ok(b), Some((o, alt))) if !plausible(&b) && b.is_ascii() && plausible(&alt) => {
+            (alt, o, None)
+        }
         // The other reading is only an alternative if it gives different
         // text: "9" is a tab in both formats.
         (Ok(b), alt) => {
@@ -589,6 +602,29 @@ mod tests {
         ] {
             assert!(matches!(err(bad), Error::BadHeader(_)), "{bad}");
         }
+        // Repeated fields are rejected, also with the same value and
+        // wherever the repetition is.
+        for (bad, key) in [
+            ("Typ=1 Len=1 Len=2: 104,105", "Len"),
+            ("Typ=1 Len=2 Len=2: 104,105", "Len"),
+            ("Typ=1 Typ=1 Len=2: 104,105", "Typ"),
+            ("Typ=1 Len=2 Typ=96: 104,105", "Typ"),
+            (
+                "Typ=1 Len=2 CharacterSet=AL32UTF8 CharacterSet=AL32UTF8: 104,105",
+                "CharacterSet",
+            ),
+            (
+                "Typ=1 CharacterSet=US7ASCII Len=2 CharacterSet=AL16UTF16: 0,65",
+                "CharacterSet",
+            ),
+        ] {
+            assert_eq!(err(bad), Error::DuplicateField(key.into()), "{bad}");
+        }
+        // A repeated field with an unparsable value is a syntax error first.
+        assert!(matches!(
+            err("Typ=1 Len=2 Len=x: 104,105"),
+            Error::BadHeader(_)
+        ));
         let parsed = parse_input("Typ=96 Len=1 CharacterSet=US7ASCII: 65", Format::Auto).unwrap();
         assert_eq!(
             parsed.header,
@@ -873,5 +909,316 @@ mod tests {
         assert_eq!(conv(&hex), text);
         let dec: Vec<String> = text.bytes().map(|b| b.to_string()).collect();
         assert_eq!(conv(&format!("Typ=1 Len=32767: {}", dec.join(","))), text);
+    }
+
+    #[test]
+    fn separators() {
+        // Commas and any whitespace separate bytes; empty tokens are ignored.
+        for input in [
+            "104,105",
+            "104, 105",
+            "104 ,105",
+            " 104 , 105 ",
+            "104,,105",
+            "104,105,",
+            ",104,105",
+            "104\t105",
+            "104\n105",
+            "104\r\n105",
+        ] {
+            assert_eq!(conv(input), "hi", "{input:?}");
+        }
+        assert_eq!(conv("68\t69\n6a"), "hij");
+    }
+
+    #[test]
+    fn header_variants() {
+        // Len and CharacterSet are optional, spacing is free.
+        assert_eq!(conv("Typ=1: 104,105"), "hi");
+        assert_eq!(conv("Typ=96: 104,105"), "hi");
+        assert_eq!(conv("Typ=1 Len=2 : 104,105"), "hi");
+        assert_eq!(conv("Typ=1  Len=2:104,105"), "hi");
+        assert_eq!(conv("Typ=1 Len=2:\n104,105"), "hi");
+        let p = parse_input("Typ=1: 104,105", Format::Auto).unwrap();
+        assert_eq!(
+            p.header,
+            Some(Header {
+                typ: Some(1),
+                len: None,
+                charset: None
+            })
+        );
+        // The header is case sensitive, as printed by Oracle.
+        assert_eq!(err("typ=1 Len=1: 65"), Error::BadToken("typ=1".into()));
+        assert!(matches!(err("Typ=1 len=1: 65"), Error::BadHeader(_)));
+        // Other character sets are accepted; non-ASCII bytes are still rejected.
+        for cs in ["US7ASCII", "WE8MSWIN1252", "WE8ISO8859P1", "UTF8"] {
+            assert_eq!(
+                conv(&format!("Typ=1 Len=2 CharacterSet={cs}: 104,105")),
+                "hi"
+            );
+        }
+        assert_eq!(
+            err("Typ=1 Len=1 CharacterSet=WE8MSWIN1252: 228"),
+            Error::NotAscii { pos: 1, byte: 228 }
+        );
+        // Typ is checked before the bytes are parsed.
+        assert_eq!(err("Typ=23 Len=2: zz"), Error::UnsupportedType(23));
+    }
+
+    #[test]
+    fn block_dump_variants() {
+        assert_eq!(conv("col 0:[2]41 42"), "AB");
+        assert_eq!(conv("col 123: [ 2] 41 42"), "AB");
+        assert_eq!(conv("col 0: [  2]  41   42  "), "AB");
+        assert_eq!(conv("col 0: [2]\n41\n42"), "AB");
+        assert_eq!(conv("col 0: [ 2] 41,42"), "AB");
+        // Hex letters in either case, and digits only.
+        assert_eq!(conv("col 0: [ 2] 6A 6b"), "jk");
+        assert_eq!(conv("col 0: [ 2] 30 39"), "09");
+        // A block dump after a DUMP header is not a block dump.
+        assert!(parse_input("Typ=1 Len=2: col 0: [ 2] 41 42", Format::Auto).is_err());
+        // Block dump errors win over byte errors.
+        assert_eq!(
+            parse_input("col 0: [ 2] zz", Format::Dec),
+            Err(Error::DecBlockDump)
+        );
+        assert_eq!(err("col 9: *NULL*"), Error::NullColumn(9));
+    }
+
+    #[test]
+    fn null_variants() {
+        for input in ["NULL", "null", "Null", "  NULL\n"] {
+            assert_eq!(err(input), Error::NullValue, "{input:?}");
+        }
+        // NULL is only recognized on its own.
+        assert_eq!(err("NULL,41"), Error::BadToken("NULL".into()));
+    }
+
+    #[test]
+    fn national_charset_edges() {
+        // Odd length or a non-zero high byte: not UTF-16.
+        assert_eq!(conv("004100"), "\\0A\\0");
+        assert_eq!(conv("00410142"), "\\0A\\x01B");
+        // Two NULs are rejected as UTF-16 (U+0000).
+        assert_eq!(err("0000"), Error::NationalCharset(None));
+        // The UTF-16 check runs before the ASCII check.
+        assert_eq!(err("00E400F6"), Error::NationalCharset(None));
+        // Forced formats are checked as well.
+        assert_eq!(
+            parse_input("0,65", Format::Dec),
+            Err(Error::NationalCharset(None))
+        );
+    }
+
+    #[test]
+    fn length_mismatch_after_switch() {
+        // The header length is checked against the bytes actually used.
+        assert_eq!(
+            err("Typ=1 Len=3: 4142"),
+            Error::LengthMismatch {
+                declared: 3,
+                actual: 2
+            }
+        );
+        assert_eq!(
+            parse_input("Typ=1 Len=1: 104,105", Format::Dec),
+            Err(Error::LengthMismatch {
+                declared: 1,
+                actual: 2
+            })
+        );
+        // A length that fits only one reading does not make it ambiguous.
+        let p = parse_input("Typ=1 Len=2: 4142", Format::Auto).unwrap();
+        assert_eq!((p.format, p.alternative), (Format::Hex, None));
+    }
+
+    #[test]
+    fn not_ascii_position() {
+        assert_eq!(err("80"), Error::NotAscii { pos: 1, byte: 0x80 });
+        assert_eq!(err("41FF"), Error::NotAscii { pos: 2, byte: 0xFF });
+        assert_eq!(
+            err("Typ=1 Len=4: 104,105,33,128"),
+            Error::NotAscii { pos: 4, byte: 128 }
+        );
+        // The first non-ASCII byte is reported.
+        assert_eq!(err("4180FF"), Error::NotAscii { pos: 2, byte: 0x80 });
+        // Hex bytes 0x80..=0x99 are digits only, but must not be reread as
+        // decimal text ("80" would be "P").
+        assert_eq!(err("90 91"), Error::NotAscii { pos: 1, byte: 0x90 });
+        assert_eq!(
+            err("col 0: [ 1] 99"),
+            Error::NotAscii { pos: 1, byte: 0x99 }
+        );
+        assert_eq!(conv_as("80", Format::Dec), "P");
+    }
+
+    /// The escaped output must be unambiguous: different byte strings never
+    /// give the same text.
+    #[test]
+    fn escape_is_injective() {
+        let mut seen = std::collections::HashMap::new();
+        for a in 0..0x80u8 {
+            for b in 0..0x80u8 {
+                for bytes in [vec![a], vec![a, b]] {
+                    for quoted in [false, true] {
+                        let text = escape(&bytes, quoted);
+                        if let Some(prev) = seen.insert((text.clone(), quoted), bytes.clone()) {
+                            assert_eq!(prev, bytes, "{text}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn escape_table() {
+        for (byte, text) in [
+            (0x00, "\\0"),
+            (0x01, "\\x01"),
+            (0x07, "\\x07"),
+            (0x08, "\\x08"),
+            (0x09, "\\t"),
+            (0x0A, "\\n"),
+            (0x0B, "\\x0B"),
+            (0x0C, "\\x0C"),
+            (0x0D, "\\r"),
+            (0x1F, "\\x1F"),
+            (0x20, " "),
+            (0x22, "\""),
+            (0x27, "'"),
+            (0x5C, "\\\\"),
+            (0x7E, "~"),
+            (0x7F, "\\x7F"),
+        ] {
+            assert_eq!(escape(&[byte], false), text, "0x{byte:02X}");
+        }
+        assert_eq!(escape(b"", false), "");
+        assert_eq!(escape(b"", true), "\"\"");
+        // Escaped output contains only printable ASCII.
+        let all: Vec<u8> = (0..0x80).collect();
+        assert!(
+            escape(&all, true)
+                .bytes()
+                .all(|c| (0x20..=0x7E).contains(&c))
+        );
+    }
+
+    fn verbose(input: &str, format: Format, raw: bool) -> String {
+        let parsed = parse_input(input, format).unwrap();
+        let mut out = Vec::new();
+        let args = Args {
+            input: input.into(),
+            format,
+            raw,
+            verbose: true,
+        };
+        write_output(&mut out, &parsed, &args).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn verbose_output() {
+        assert_eq!(
+            verbose(
+                "Typ=1 Len=5 CharacterSet=AL32UTF8: 48,65,6c,6c,6f",
+                Format::Auto,
+                false
+            ),
+            "type:     VARCHAR2 (Typ=1)\n\
+             charset:  AL32UTF8\n\
+             format:   hex\n\
+             length:   5\n\
+             bytes:    48 65 6C 6C 6F\n\
+             value:    \"Hello\"\n"
+        );
+        // Without a header there are no type and charset lines.
+        assert_eq!(
+            verbose("6122095C", Format::Auto, false),
+            "format:   hex\n\
+             length:   4\n\
+             bytes:    61 22 09 5C\n\
+             value:    \"a\\\"\\t\\\\\"\n"
+        );
+        // The format line shows the format the bytes were read in.
+        assert!(verbose("65,66", Format::Hex, false).contains("format:   hex\n"));
+        assert!(verbose("65,66", Format::Auto, false).contains("format:   dec\n"));
+        assert!(verbose("Typ=1 Len=2: 20,41", Format::Auto, false).contains("format:   hex\n"));
+        // With --raw the value is unquoted and unescaped.
+        assert!(verbose("610962", Format::Auto, true).ends_with("value:    a\tb\n"));
+    }
+
+    #[test]
+    fn error_messages() {
+        for (error, text) in [
+            (Error::Empty, "no bytes given"),
+            (
+                Error::NullValue,
+                "the value is NULL, there are no characters to convert",
+            ),
+            (Error::BadToken("zz".into()), "cannot parse 'zz' as a byte"),
+            (
+                Error::NotAscii { pos: 3, byte: 0xC3 },
+                "byte 3 (0xC3) is not ASCII, only ASCII data is supported",
+            ),
+            (
+                Error::DuplicateField("Len".into()),
+                "DUMP header has the field 'Len' more than once",
+            ),
+            (
+                Error::UnsupportedType(2),
+                "Typ=2 is NUMBER, not a character type, use ora-num",
+            ),
+            (
+                Error::UnsupportedType(12),
+                "Typ=12 is DATE, not a character type",
+            ),
+            (
+                Error::UnsupportedType(999),
+                "Typ=999 is not a character type, expected Typ=1 (VARCHAR2) or Typ=96 (CHAR)",
+            ),
+            (
+                Error::NationalCharset(None),
+                "the data is in AL16UTF16 (UTF-16), the NCHAR/NVARCHAR2 national character set; \
+                 NCHAR and NVARCHAR2 are not supported",
+            ),
+            (
+                Error::NationalCharset(Some("UTF16".into())),
+                "the data is in UTF16, the NCHAR/NVARCHAR2 national character set; \
+                 NCHAR and NVARCHAR2 are not supported",
+            ),
+            (
+                Error::LengthMismatch {
+                    declared: 3,
+                    actual: 2,
+                },
+                "input declares 3 bytes, but 2 are given",
+            ),
+            (
+                Error::NullColumn(1),
+                "column 1 is NULL in the block dump, there are no characters to convert",
+            ),
+            (
+                Error::DecBlockDump,
+                "block dump bytes are always hex, -f dec cannot be used with them",
+            ),
+            (
+                Error::Output("disk full".into()),
+                "cannot write output: disk full",
+            ),
+        ] {
+            assert_eq!(error.to_string(), text);
+        }
+        assert!(
+            Error::BadHeader("Typ=x".into())
+                .to_string()
+                .contains("'Typ=x'")
+        );
+        assert!(
+            Error::BadPrefix("col x".into())
+                .to_string()
+                .contains("'col x'")
+        );
     }
 }

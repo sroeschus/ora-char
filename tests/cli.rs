@@ -1,0 +1,264 @@
+// Copyright (c) 2026 Stefan Roesch
+
+//! End-to-end tests: run the `ora-char` binary and check its exit status,
+//! standard output and standard error.
+
+use std::io::Read;
+use std::process::{Command, Output, Stdio};
+
+fn ora_char(args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_ora-char"))
+        .args(args)
+        .output()
+        .expect("failed to run ora-char")
+}
+
+/// Run ora-char and return (exit code, stdout, stderr).
+fn run(args: &[&str]) -> (i32, String, String) {
+    let out = ora_char(args);
+    (
+        out.status.code().expect("terminated by a signal"),
+        String::from_utf8(out.stdout).unwrap(),
+        String::from_utf8(out.stderr).unwrap(),
+    )
+}
+
+fn ok(args: &[&str], stdout: &str) {
+    assert_eq!(
+        run(args),
+        (0, stdout.to_string(), String::new()),
+        "{args:?}"
+    );
+}
+
+fn fails(args: &[&str], stderr: &str) {
+    assert_eq!(
+        run(args),
+        (1, String::new(), format!("error: {stderr}\n")),
+        "{args:?}"
+    );
+}
+
+#[test]
+fn readme_accepted_input() {
+    for input in [
+        "Typ=1 Len=5: 72,101,108,108,111",
+        "Typ=1 Len=5: 48,65,6c,6c,6f",
+        "Typ=1 Len=5 CharacterSet=AL32UTF8: 72,101,108,108,111",
+        "72,101,108,108,111",
+        "72 101 108 108 111",
+        "48656C6C6F",
+        "0x48656C6C6F",
+        "48 65 6c 6c 6f",
+        "col 0: [ 5] 48 65 6c 6c 6f",
+    ] {
+        ok(&[input], "Hello\n");
+    }
+}
+
+#[test]
+fn readme_examples() {
+    ok(
+        &["Typ=1 Len=11: 79,114,97,99,108,101,32,50,51,97,105"],
+        "Oracle 23ai\n",
+    );
+    ok(&["Typ=96 Len=5: 4f,4b,20,20,20"], "OK   \n");
+    ok(&["4F7261636C65"], "Oracle\n");
+    ok(&["4f 72 61 63 6c 65"], "Oracle\n");
+    ok(&["col  1: [ 6]  4f 72 61 63 6c 65"], "Oracle\n");
+    ok(&["-f", "hex", "65,66,67"], "efg\n");
+    ok(&["-f", "hex", "Typ=1 Len=3: 61,62,63"], "abc\n");
+    ok(&["610962"], "a\\tb\n");
+    ok(
+        &["-v", "Typ=96 Len=5: 104,105,32,32,32"],
+        "type:     CHAR (Typ=96)\n\
+         format:   dec\n\
+         length:   5\n\
+         bytes:    68 69 20 20 20\n\
+         value:    \"hi   \"\n",
+    );
+    ok(
+        &["-v", "Typ=1 Len=5 CharacterSet=AL32UTF8: 48,65,6c,6c,6f"],
+        "type:     VARCHAR2 (Typ=1)\n\
+         charset:  AL32UTF8\n\
+         format:   hex\n\
+         length:   5\n\
+         bytes:    48 65 6C 6C 6F\n\
+         value:    \"Hello\"\n",
+    );
+}
+
+#[test]
+fn readme_errors() {
+    fails(
+        &["Typ=1 Len=4: 79,114,97"],
+        "input declares 4 bytes, but 3 are given",
+    );
+    fails(
+        &["Typ=1 Len=1 Len=2: 104,105"],
+        "DUMP header has the field 'Len' more than once",
+    );
+    fails(
+        &["Typ=2 Len=3: 194,2,24"],
+        "Typ=2 is NUMBER, not a character type, use ora-num",
+    );
+    fails(
+        &["NULL"],
+        "the value is NULL, there are no characters to convert",
+    );
+    fails(
+        &["col 1: *NULL*"],
+        "column 1 is NULL in the block dump, there are no characters to convert",
+    );
+    fails(
+        &["-f", "dec", "col 0: [ 2] 41 42"],
+        "block dump bytes are always hex, -f dec cannot be used with them",
+    );
+    fails(
+        &["C3A4"],
+        "byte 1 (0xC3) is not ASCII, only ASCII data is supported",
+    );
+    fails(
+        &["Typ=1 Len=4: 0,72,0,105"],
+        "the data is in AL16UTF16 (UTF-16), the NCHAR/NVARCHAR2 national character set; \
+         NCHAR and NVARCHAR2 are not supported",
+    );
+}
+
+#[test]
+fn ambiguity_note() {
+    let (code, stdout, stderr) = run(&["65,66,67"]);
+    assert_eq!((code, stdout.as_str()), (0, "ABC\n"));
+    assert_eq!(
+        stderr,
+        "note: input is ambiguous, read as dec giving \"ABC\"; as hex it is \"efg\", \
+         use -f to choose\n"
+    );
+    // The note goes to stderr only, also in verbose mode.
+    let (code, stdout, stderr) = run(&["-v", "41 42"]);
+    assert_eq!(code, 0);
+    assert!(stdout.ends_with("value:    \"AB\"\n"), "{stdout}");
+    assert!(!stdout.contains("note"));
+    assert!(stderr.starts_with("note: input is ambiguous, read as hex giving \"AB\""));
+    // A forced format or identical readings give no note.
+    ok(&["-f", "dec", "65,66,67"], "ABC\n");
+    ok(&["Typ=1 Len=1: 9"], "\\t\n");
+}
+
+#[test]
+fn raw_output() {
+    let out = ora_char(&["--raw", "00410a5c7f"]);
+    assert!(out.status.success());
+    assert_eq!(out.stdout, b"\0A\n\\\x7f\n");
+    assert!(out.stderr.is_empty());
+    // Escaped by default.
+    ok(&["00410a5c7f"], "\\0A\\n\\\\\\x7F\n");
+}
+
+#[test]
+fn options_combine() {
+    ok(
+        &["-v", "-f", "hex", "--raw", "41"],
+        "format:   hex\nlength:   1\nbytes:    41\nvalue:    A\n",
+    );
+    ok(&["--format=dec", "65"], "A\n");
+    ok(&["-fhex", "65"], "e\n");
+    ok(
+        &["-vfhex", "41"],
+        "format:   hex\nlength:   1\nbytes:    41\nvalue:    \"A\"\n",
+    );
+    // Options may follow the input.
+    ok(&["65,66", "-f", "hex"], "ef\n");
+}
+
+#[test]
+fn hyphen_input_is_an_option() {
+    // No valid input starts with '-', so it is parsed as an (unknown) option.
+    let (code, _, stderr) = run(&["-1"]);
+    assert_eq!(code, 2);
+    assert!(
+        stderr.starts_with("error: unexpected argument '-1' found"),
+        "{stderr}"
+    );
+    // "--" still passes it through as input.
+    fails(&["--", "-1"], "cannot parse '-1' as a byte");
+}
+
+#[test]
+fn usage_errors() {
+    // Missing input, unknown option and bad format value are clap errors (exit 2).
+    for args in [
+        &[][..],
+        &["--bogus", "41"],
+        &["-f", "oct", "41"],
+        &["41", "42"],
+    ] {
+        let (code, stdout, stderr) = run(args);
+        assert_eq!(code, 2, "{args:?}");
+        assert!(stdout.is_empty(), "{args:?}");
+        assert!(stderr.starts_with("error:"), "{args:?}: {stderr}");
+    }
+    let (_, _, stderr) = run(&["-f", "oct", "41"]);
+    assert!(
+        stderr.contains("[possible values: auto, dec, hex]"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn help_and_version() {
+    let (code, stdout, _) = run(&["--help"]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("Usage: ora-char [OPTIONS] <INPUT>"));
+    assert!(stdout.contains("--raw"));
+    assert!(stdout.contains("Copyright (c) 2026 Stefan Roesch"));
+    ok(
+        &["--version"],
+        &format!("ora-char {}\n", env!("CARGO_PKG_VERSION")),
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn write_error_exit_status() {
+    let full = std::fs::File::create("/dev/full").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_ora-char"))
+        .arg("4142")
+        .stdout(full)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.starts_with("error: cannot write output: "),
+        "{stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn closed_pipe_is_not_an_error() {
+    // 30000 bytes of 0x01 print as 120000 characters, more than a pipe buffer.
+    let input = "01".repeat(30000);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ora-char"))
+        .arg(&input)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let mut first = [0u8; 8];
+    stdout.read_exact(&mut first).unwrap();
+    assert_eq!(&first, b"\\x01\\x01");
+    drop(stdout);
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    let status = child.wait().unwrap();
+    assert_eq!(status.code(), Some(0));
+    assert_eq!(stderr, "");
+}
