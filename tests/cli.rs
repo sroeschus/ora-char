@@ -211,10 +211,62 @@ fn help_and_version() {
     assert_eq!(code, 0);
     assert!(stdout.contains("Usage: ora-char [OPTIONS] <INPUT>"));
     assert!(stdout.contains("--raw"));
+    assert!(stdout.contains("-r, --reverse"));
     assert!(stdout.contains("Copyright (c) 2026 Stefan Roesch"));
     ok(
         &["--version"],
         &format!("ora-char {}\n", env!("CARGO_PKG_VERSION")),
+    );
+}
+
+#[test]
+fn reverse() {
+    ok(&["-r", "Hello"], "48 65 6C 6C 6F\n");
+    ok(&["--reverse", "Hello"], "48 65 6C 6C 6F\n");
+    ok(&["-r", "-f", "hex", "Hello"], "48 65 6C 6C 6F\n");
+    ok(&["-r", "-f", "dec", "Hello"], "72,101,108,108,111\n");
+    ok(&["-rfdec", "AB"], "65,66\n");
+    ok(&["Hello", "-r"], "48 65 6C 6C 6F\n");
+    ok(
+        &["-r", "-v", "hi   "],
+        "value:    \"hi   \"\nlength:   5\ndump:     Typ=1 Len=5: 104,105,32,32,32\nbytes:    68 69 20 20 20\n",
+    );
+    // Escapes are decoded, so output of the forward direction converts back.
+    ok(&["-r", r"a\tb"], "61 09 62\n");
+    ok(&["-r", "--raw", r"a\tb"], "61 5C 74 62\n");
+    // Text starting with '-' needs "--".
+    ok(&["-r", "--", "-1"], "2D 31\n");
+}
+
+#[test]
+fn reverse_round_trip() {
+    for text in ["Oracle 23ai", "OK   ", r"a\tb\\c\x01", "~!@#$%^&*()"] {
+        let (code, hex, _) = run(&["-r", text]);
+        assert_eq!(code, 0);
+        ok(&[hex.trim_end()], &format!("{text}\n"));
+        let (code, dec, _) = run(&["-r", "-f", "dec", text]);
+        assert_eq!(code, 0);
+        ok(&["-f", "dec", dec.trim_end()], &format!("{text}\n"));
+    }
+}
+
+#[test]
+fn reverse_errors() {
+    fails(
+        &["-r", "Grüße"],
+        "character 3 ('ü') is not ASCII, only ASCII data is supported",
+    );
+    fails(
+        &["-r", ""],
+        "the text is empty, Oracle stores an empty string as NULL",
+    );
+    fails(
+        &["-r", r"C:\Users"],
+        r"invalid escape sequence '\U', use \\ for a backslash or --raw to take the text literally",
+    );
+    fails(
+        &["-r", r"\x80"],
+        "byte 1 (0x80) is not ASCII, only ASCII data is supported",
     );
 }
 

@@ -1,6 +1,6 @@
 .TH ORA-CHAR 1 "November 2026" "ora-char 0.1.0" "User Commands"
 .SH NAME
-ora-char \- convert Oracle internal CHAR and VARCHAR2 bytes into characters
+ora-char \- convert Oracle internal CHAR and VARCHAR2 bytes into characters and back
 .SH SYNOPSIS
 .B ora-char
 .RB [ \-v ]
@@ -8,6 +8,14 @@ ora-char \- convert Oracle internal CHAR and VARCHAR2 bytes into characters
 .RB [ \-f
 .IR format ]
 .I bytes
+.br
+.B ora-char \-r
+.RB [ \-v ]
+.RB [ \-\-raw ]
+.RB [ \-f
+.IR format ]
+.RB [ \-\- ]
+.I text
 .SH DESCRIPTION
 .B ora-char
 decodes an Oracle
@@ -19,6 +27,10 @@ value from its internal byte representation, as shown by
 .BR "DUMP(x, 16)" ,
 .B RAWTOHEX()
 or a block dump, and prints its characters.
+With
+.BR \-r ,
+it converts ASCII text into the internal representation instead (see
+.BR "REVERSE CONVERSION" ).
 .PP
 This release supports ASCII data only; bytes of 0x80 and above are rejected.
 .B NCHAR
@@ -28,8 +40,17 @@ are not supported (see
 .BR "INPUT FORMATS" ).
 .SH OPTIONS
 .TP
+.BR \-r ", " \-\-reverse
+Convert ASCII text into the internal representation.
+.TP
 .BR \-f ", " \-\-format " \fIformat\fR"
-The input format.
+The input format, or with
+.B \-r
+the output format
+.RB ( hex
+unless
+.B dec
+is given).
 .I format
 is one of:
 .RS
@@ -55,6 +76,9 @@ or
 Print the characters unchanged instead of escaping control characters and
 backslashes (see
 .BR OUTPUT ).
+With
+.BR \-r ,
+take the text literally instead of decoding escape sequences.
 .TP
 .BR \-v ", " \-\-verbose
 Also print the type and character set (if given in a
@@ -173,6 +197,38 @@ for all other control characters, including 0x7F.
 With
 .BR \-\-raw ,
 the bytes are printed unchanged.
+.SH REVERSE CONVERSION
+With
+.BR \-r ,
+.I text
+is converted into hex bytes separated by spaces, e.g.\&
+.BR "48 65 6C" ,
+or with
+.B "\-f dec"
+into a decimal byte list, as in
+.BR DUMP() .
+The escape sequences listed under
+.B OUTPUT
+are decoded, as is
+.B \e"
+from verbose output, so the output of the forward conversion converts back
+to the same bytes; any other backslash sequence is an error.
+Use
+.B \e\e
+for a backslash, or
+.B \-\-raw
+to take the text literally.
+Text that starts with
+.B \-
+must follow
+.BR \-\- .
+Non-ASCII characters and the empty string, which Oracle stores as NULL, are
+rejected.
+With
+.BR \-v ,
+the value, its length, the
+.B DUMP()
+output and the hex bytes are printed.
 .SH EXIT STATUS
 0 on success, 1 if the input cannot be parsed or is not ASCII, and 2 for
 invalid command line options.
@@ -204,6 +260,18 @@ format:   hex
 length:   5
 bytes:    48 65 6C 6C 6F
 value:    "Hello"
+.sp
+$ ora-char \-r Hello
+48 65 6C 6C 6F
+.sp
+$ ora-char \-r \-f dec 'a\etb'
+97,9,98
+.sp
+$ ora-char \-r \-v 'hi   '
+value:    "hi   "
+length:   5
+dump:     Typ=1 Len=5: 104,105,32,32,32
+bytes:    68 69 20 20 20
 .fi
 .SH SEE ALSO
 .BR ora-num (1)

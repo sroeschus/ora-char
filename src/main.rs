@@ -4,6 +4,8 @@
 //! `VARCHAR2` value (as shown by `DUMP()`, `DUMP(x, 16)`, `RAWTOHEX()` or a
 //! block dump) into its characters.
 //!
+//! With `--reverse`, it converts ASCII text into that representation instead.
+//!
 //! This release only supports ASCII data: every byte must be below 0x80.
 //! Control characters are printed as escape sequences unless `--raw` is given.
 
@@ -35,19 +37,25 @@ impl fmt::Display for Format {
 }
 
 /// Convert the Oracle internal representation of a CHAR or VARCHAR2 value
-/// into its characters (ASCII only).
+/// into its characters, or with -r characters into the internal representation
+/// (ASCII only).
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None, after_help = "Copyright (c) 2026 Stefan Roesch")]
 struct Args {
     /// Oracle internal value, e.g. "Typ=1 Len=3: 97,98,99", "97,98,99", "616263", "0x616263"
-    /// or "col 0: [ 3] 61 62 63"
+    /// or "col 0: [ 3] 61 62 63"; with -r ASCII text, e.g. "abc"
     input: String,
 
-    /// Input format
+    /// Convert ASCII text into the internal representation
+    #[arg(short, long)]
+    reverse: bool,
+
+    /// Input format (output format with -r: hex, the default, or dec)
     #[arg(short, long, value_enum, default_value_t = Format::Auto)]
     format: Format,
 
     /// Print the characters unchanged instead of escaping control characters and backslashes
+    /// (with -r: take the text literally instead of decoding escape sequences)
     #[arg(long)]
     raw: bool,
 
@@ -76,6 +84,15 @@ enum Error {
     },
     NullColumn(u32),
     DecBlockDump,
+    /// `-r` input character at 1-based position `pos` is not ASCII.
+    NotAsciiChar {
+        pos: usize,
+        ch: char,
+    },
+    /// `-r` input has an unknown or incomplete escape sequence.
+    BadEscape(String),
+    /// `-r` input is empty, which Oracle stores as NULL.
+    EmptyText,
     /// Writing the output failed (the message of the `io::Error`).
     Output(String),
 }
@@ -127,6 +144,19 @@ impl fmt::Display for Error {
             Error::NullColumn(col) => write!(
                 f,
                 "column {col} is NULL in the block dump, there are no characters to convert"
+            ),
+            Error::NotAsciiChar { pos, ch } => write!(
+                f,
+                "character {pos} ('{ch}') is not ASCII, only ASCII data is supported"
+            ),
+            Error::BadEscape(seq) => write!(
+                f,
+                "invalid escape sequence '{seq}', use \\\\ for a backslash or --raw to take \
+                 the text literally"
+            ),
+            Error::EmptyText => write!(
+                f,
+                "the text is empty, Oracle stores an empty string as NULL"
             ),
             Error::Output(msg) => write!(f, "cannot write output: {msg}"),
         }
@@ -422,18 +452,95 @@ fn escape(bytes: &[u8], quoted: bool) -> String {
     out
 }
 
-fn run(args: &Args) -> Result<(), Error> {
-    let parsed = parse_input(&args.input, args.format)?;
-    if let Some((other, alt)) = &parsed.alternative {
-        eprintln!(
-            "note: input is ambiguous, read as {} giving {}; as {other} it is {}, use -f to choose",
-            parsed.format,
-            escape(&parsed.bytes, true),
-            escape(alt, true)
-        );
+/// Bytes of the ASCII text `text` for `--reverse`. Unless `raw`, the escape
+/// sequences that the forward conversion prints (`\\`, `\n`, `\t`, `\r`,
+/// `\0`, `\xNN`, and `\"` from verbose output) are decoded.
+fn encode_text(text: &str, raw: bool) -> Result<Vec<u8>, Error> {
+    if text.is_empty() {
+        return Err(Error::EmptyText);
     }
+    let chars: Vec<char> = text.chars().collect();
+    let mut bytes = Vec::with_capacity(chars.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if !c.is_ascii() {
+            return Err(Error::NotAsciiChar { pos: i + 1, ch: c });
+        }
+        if raw || c != '\\' {
+            bytes.push(c as u8);
+            i += 1;
+            continue;
+        }
+        let bad =
+            |len: usize| Error::BadEscape(chars[i..(i + len).min(chars.len())].iter().collect());
+        let (byte, len) = match chars.get(i + 1) {
+            Some('\\') => (b'\\', 2),
+            Some('"') => (b'"', 2),
+            Some('n') => (b'\n', 2),
+            Some('t') => (b'\t', 2),
+            Some('r') => (b'\r', 2),
+            Some('0') => (0, 2),
+            Some('x') => {
+                let digits = chars.get(i + 2..i + 4).ok_or_else(|| bad(4))?;
+                if !digits.iter().all(char::is_ascii_hexdigit) {
+                    return Err(bad(4));
+                }
+                let byte = u8::from_str_radix(&digits.iter().collect::<String>(), 16)
+                    .map_err(|_| bad(4))?;
+                if !byte.is_ascii() {
+                    return Err(Error::NotAscii {
+                        pos: bytes.len() + 1,
+                        byte,
+                    });
+                }
+                (byte, 4)
+            }
+            _ => return Err(bad(2)),
+        };
+        bytes.push(byte);
+        i += len;
+    }
+    Ok(bytes)
+}
+
+/// Write the internal representation of `bytes` (`--reverse`) to `out`:
+/// hex bytes separated by spaces, or a decimal byte list with `-f dec`.
+fn write_reverse(out: &mut impl Write, bytes: &[u8], args: &Args) -> io::Result<()> {
+    let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02X}")).collect();
+    let hex = hex.join(" ");
+    let dec: Vec<String> = bytes.iter().map(u8::to_string).collect();
+    let dec = dec.join(",");
+    if args.verbose {
+        writeln!(out, "value:    {}", escape(bytes, true))?;
+        writeln!(out, "length:   {}", bytes.len())?;
+        writeln!(out, "dump:     Typ=1 Len={}: {dec}", bytes.len())?;
+        writeln!(out, "bytes:    {hex}")
+    } else if args.format == Format::Dec {
+        writeln!(out, "{dec}")
+    } else {
+        writeln!(out, "{hex}")
+    }
+}
+
+fn run(args: &Args) -> Result<(), Error> {
     let mut out = io::stdout().lock();
-    match write_output(&mut out, &parsed, args).and_then(|()| out.flush()) {
+    let written = if args.reverse {
+        let bytes = encode_text(&args.input, args.raw)?;
+        write_reverse(&mut out, &bytes, args)
+    } else {
+        let parsed = parse_input(&args.input, args.format)?;
+        if let Some((other, alt)) = &parsed.alternative {
+            eprintln!(
+                "note: input is ambiguous, read as {} giving {}; as {other} it is {}, use -f to choose",
+                parsed.format,
+                escape(&parsed.bytes, true),
+                escape(alt, true)
+            );
+        }
+        write_output(&mut out, &parsed, args)
+    };
+    match written.and_then(|()| out.flush()) {
         // The reader went away (e.g. `| head -c 1`): nothing left to do.
         Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(()),
         result => result.map_err(|e| Error::Output(e.to_string())),
@@ -791,6 +898,7 @@ mod tests {
     fn args(raw: bool, verbose: bool) -> Args {
         Args {
             input: String::new(),
+            reverse: false,
             format: Format::Auto,
             raw,
             verbose,
@@ -1110,6 +1218,7 @@ mod tests {
         let mut out = Vec::new();
         let args = Args {
             input: input.into(),
+            reverse: false,
             format,
             raw,
             verbose: true,
@@ -1147,6 +1256,96 @@ mod tests {
         assert!(verbose("Typ=1 Len=2: 20,41", Format::Auto, false).contains("format:   hex\n"));
         // With --raw the value is unquoted and unescaped.
         assert!(verbose("610962", Format::Auto, true).ends_with("value:    a\tb\n"));
+    }
+
+    fn rev(text: &str, format: Format, verbose: bool) -> String {
+        let bytes = encode_text(text, false).unwrap();
+        let args = Args {
+            input: text.into(),
+            reverse: true,
+            format,
+            raw: false,
+            verbose,
+        };
+        let mut out = Vec::new();
+        write_reverse(&mut out, &bytes, &args).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn reverse_output() {
+        assert_eq!(rev("Hello", Format::Auto, false), "48 65 6C 6C 6F\n");
+        assert_eq!(rev("Hello", Format::Hex, false), "48 65 6C 6C 6F\n");
+        assert_eq!(rev("Hello", Format::Dec, false), "72,101,108,108,111\n");
+        assert_eq!(
+            rev("hi   ", Format::Auto, true),
+            "value:    \"hi   \"\n\
+             length:   5\n\
+             dump:     Typ=1 Len=5: 104,105,32,32,32\n\
+             bytes:    68 69 20 20 20\n"
+        );
+        // Verbose output is the same for every format.
+        assert_eq!(rev("a", Format::Dec, true), rev("a", Format::Hex, true));
+    }
+
+    #[test]
+    fn reverse_escapes() {
+        let enc = |t| encode_text(t, false);
+        assert_eq!(enc(r"a\tb"), Ok(b"a\tb".to_vec()));
+        assert_eq!(
+            enc(r#"\\\n\r\0\"\x7f\x7F\x01"#),
+            Ok(b"\\\n\r\0\"\x7f\x7f\x01".to_vec())
+        );
+        // Characters that are not escaped stay as they are, including quotes.
+        assert_eq!(enc("say \"hi\""), Ok(b"say \"hi\"".to_vec()));
+        // --raw takes the text literally.
+        assert_eq!(encode_text(r"C:\temp", true), Ok(br"C:\temp".to_vec()));
+        assert_eq!(encode_text(r"a\", true), Ok(br"a\".to_vec()));
+        for (text, seq) in [
+            (r"a\", r"\"),
+            (r"\q", r"\q"),
+            (r"\x", r"\x"),
+            (r"\x4", r"\x4"),
+            (r"\x4g", r"\x4g"),
+            (r"\x+1", r"\x+1"),
+            (r"\xä1", r"\xä1"),
+        ] {
+            assert_eq!(enc(text), Err(Error::BadEscape(seq.into())), "{text}");
+        }
+        assert_eq!(enc(r"ab\x80"), Err(Error::NotAscii { pos: 3, byte: 0x80 }));
+        assert_eq!(enc(r"\xFF"), Err(Error::NotAscii { pos: 1, byte: 0xFF }));
+    }
+
+    #[test]
+    fn reverse_errors() {
+        assert_eq!(encode_text("", false), Err(Error::EmptyText));
+        assert_eq!(encode_text("", true), Err(Error::EmptyText));
+        assert_eq!(
+            encode_text("aäb", false),
+            Err(Error::NotAsciiChar { pos: 2, ch: 'ä' })
+        );
+        assert_eq!(
+            encode_text("€", true),
+            Err(Error::NotAsciiChar { pos: 1, ch: '€' })
+        );
+    }
+
+    #[test]
+    fn reverse_round_trip() {
+        // Every ASCII byte survives escape -> encode_text -> hex -> parse_input.
+        let all: Vec<u8> = (0..0x80).collect();
+        for quoted in [false, true] {
+            let mut text = escape(&all, quoted);
+            if quoted {
+                text = text[1..text.len() - 1].to_string();
+            }
+            let bytes = encode_text(&text, false).unwrap();
+            assert_eq!(bytes, all, "quoted={quoted}");
+            let hex = rev(&text, Format::Hex, false);
+            assert_eq!(parse_input(hex.trim_end(), Format::Hex).unwrap().bytes, all);
+            let dec = rev(&text, Format::Dec, false);
+            assert_eq!(parse_input(dec.trim_end(), Format::Dec).unwrap().bytes, all);
+        }
     }
 
     #[test]
@@ -1202,6 +1401,18 @@ mod tests {
             (
                 Error::DecBlockDump,
                 "block dump bytes are always hex, -f dec cannot be used with them",
+            ),
+            (
+                Error::NotAsciiChar { pos: 2, ch: 'ä' },
+                "character 2 ('ä') is not ASCII, only ASCII data is supported",
+            ),
+            (
+                Error::BadEscape(r"\q".into()),
+                r"invalid escape sequence '\q', use \\ for a backslash or --raw to take the text literally",
+            ),
+            (
+                Error::EmptyText,
+                "the text is empty, Oracle stores an empty string as NULL",
             ),
             (
                 Error::Output("disk full".into()),

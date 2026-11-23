@@ -2,7 +2,8 @@
 
 Convert an Oracle `CHAR` or `VARCHAR2` value from its internal byte
 representation (as shown by `DUMP()`, `DUMP(x, 16)`, `RAWTOHEX()` or a block
-dump) into its characters.
+dump) into its characters. With `-r`, it converts ASCII text into the internal
+representation.
 
 This release supports ASCII data only: every byte must be below `0x80`.
 `NCHAR` and `NVARCHAR2` are not supported.
@@ -38,8 +39,9 @@ ora-char [OPTIONS] <INPUT>
 
 | Option                  | Description                                                       |
 |-------------------------|-------------------------------------------------------------------|
-| `-f, --format <FORMAT>` | Input format: `auto` (default), `dec` or `hex`                    |
-| `--raw`                 | Print the characters unchanged, without escaping                  |
+| `-r, --reverse`         | Convert ASCII text into the internal representation               |
+| `-f, --format <FORMAT>` | Input format: `auto` (default), `dec` or `hex` (output with `-r`) |
+| `--raw`                 | Print the characters unchanged, without escaping (`-r`: take the text literally) |
 | `-v, --verbose`         | Also print the type, length and bytes                             |
 | `-h, --help`            | Show help                                                         |
 | `-V, --version`         | Show version                                                      |
@@ -202,6 +204,53 @@ format:   dec
 length:   5
 bytes:    68 69 20 20 20
 value:    "hi   "
+```
+
+### Reverse conversion
+
+With `-r`, the input is ASCII text and the output is its internal
+representation: hex bytes separated by spaces (e.g. `48 65 6C`) by default, or
+a decimal byte list as in `DUMP(x)` with `-f dec`.
+
+```sh
+$ ora-char -r Hello
+48 65 6C 6C 6F
+
+$ ora-char -r -f dec Hello
+72,101,108,108,111
+```
+
+The escape sequences that the forward conversion prints (`\\`, `\n`, `\t`,
+`\r`, `\0`, `\xNN`, and `\"` from verbose output) are decoded, so its output
+converts back to the same bytes. Write a backslash as `\\`, or use `--raw` to
+take the text literally:
+
+```sh
+$ ora-char -r 'a\tb'
+61 09 62
+
+$ ora-char -r --raw 'C:\temp'
+43 3A 5C 74 65 6D 70
+```
+
+Text that starts with `-` must follow `--`, e.g. `ora-char -r -- -1`.
+Non-ASCII characters and the empty string (which Oracle stores as `NULL`) are
+rejected:
+
+```sh
+$ ora-char -r Grüße
+error: character 3 ('ü') is not ASCII, only ASCII data is supported
+```
+
+With `-v`, the value, its length, the `DUMP()` output and the hex bytes are
+shown:
+
+```sh
+$ ora-char -r -v 'hi   '
+value:    "hi   "
+length:   5
+dump:     Typ=1 Len=5: 104,105,32,32,32
+bytes:    68 69 20 20 20
 ```
 
 ## Testing
