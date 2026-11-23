@@ -1,0 +1,198 @@
+.TH ORA-CHAR 1 "November 2026" "ora-char 0.1.0" "User Commands"
+.SH NAME
+ora-char \- convert Oracle internal CHAR and VARCHAR2 bytes into characters
+.SH SYNOPSIS
+.B ora-char
+.RB [ \-v ]
+.RB [ \-\-raw ]
+.RB [ \-f
+.IR format ]
+.I bytes
+.SH DESCRIPTION
+.B ora-char
+decodes an Oracle
+.B CHAR
+or
+.B VARCHAR2
+value from its internal byte representation, as shown by
+.BR DUMP() ,
+.BR "DUMP(x, 16)" ,
+.B RAWTOHEX()
+or a block dump, and prints its characters.
+.PP
+This release supports ASCII data only; bytes of 0x80 and above are rejected.
+.B NCHAR
+and
+.B NVARCHAR2
+are not supported (see
+.BR "INPUT FORMATS" ).
+.SH OPTIONS
+.TP
+.BR \-f ", " \-\-format " \fIformat\fR"
+The input format.
+.I format
+is one of:
+.RS
+.TP
+.B auto
+Detect the input format (see
+.BR "INPUT FORMATS" ).
+This is the default.
+.TP
+.B dec
+Decimal bytes, e.g.\&
+.BR 97,98,99 .
+.TP
+.B hex
+Hex bytes, e.g.\&
+.BR 616263 ,
+.B 61,62,63
+or
+.BR "col 0: [ 3] 61 62 63" .
+.RE
+.TP
+.B \-\-raw
+Print the characters unchanged instead of escaping control characters and
+backslashes (see
+.BR OUTPUT ).
+.TP
+.BR \-v ", " \-\-verbose
+Also print the type and character set (if given in a
+.B DUMP()
+header), the format the input was read in, the length and the bytes.
+The value is shown in double quotes so that the blank padding of
+.B CHAR
+values is visible.
+.TP
+.BR \-h ", " \-\-help
+Show help.
+.TP
+.BR \-V ", " \-\-version
+Show the version.
+.SH INPUT FORMATS
+.TP
+.B DUMP() output
+.B "Typ=1 Len=3: 97,98,99"
+(decimal) or
+.B "Typ=1 Len=3: 61,62,63"
+.RB ( "DUMP(x, 16)" ,
+hex).
+The type must be 1
+.RB ( VARCHAR2 )
+or 96
+.RB ( CHAR ),
+and the number of bytes must match
+.BR Len .
+A
+.B CharacterSet=
+field, as printed by
+.B "DUMP(x, 1010)"
+and
+.BR "DUMP(x, 1016)" ,
+is accepted.
+.IP
+.B DUMP()
+shows
+.B NCHAR
+and
+.B NVARCHAR2
+values with the same type codes, so
+.B ora-char
+rejects data in their usual national character set,
+.BR AL16UTF16 :
+an even number of bytes in which every other byte, starting with the first,
+is zero, or a
+.B CharacterSet=AL16UTF16
+field.
+With the
+.B UTF8
+national character set, ASCII text has the same bytes as in
+.B CHAR
+and
+.B VARCHAR2
+and cannot be detected.
+.IP
+The input
+.B NULL
+is reported as an error.
+.TP
+.B Byte list
+Bytes separated by commas or whitespace, e.g.\&
+.B 97,98,99
+or
+.BR "61 62 63" .
+In hex, a token may hold several bytes and an optional
+.B 0x
+prefix, e.g.\&
+.B "6162 63"
+or
+.BR 0x61,0x62 .
+.TP
+.B Contiguous hex
+As returned by
+.BR RAWTOHEX() ,
+with an optional
+.B 0x
+prefix, e.g.\&
+.BR 0x616263 .
+.TP
+.B Block dump
+A column entry such as
+.BR "col 0: [ 3] 61 62 63" .
+The bytes are always hex, and their number must match the count in brackets;
+.B "\-f dec"
+is rejected for this format.
+A NULL column
+.RB ( "col 1: *NULL*" )
+is reported as an error.
+.PP
+With
+.BR "\-f auto" ,
+block dump input is read as hex.
+Other input is read as hex if it is a single contiguous token, contains hex
+letters, or consists of space-separated two-character pairs; otherwise it is
+read as decimal.
+If only the other format gives printable text of the declared length, the
+other format is used instead.
+If both formats give printable text, the detected format is used and a note
+on standard error shows the other reading; use
+.B \-f
+to choose.
+.SH OUTPUT
+Printable ASCII characters are printed as they are.
+Backslashes and control characters are escaped as
+.BR \e\e ,
+.BR \en ,
+.BR \et ,
+.BR \er ,
+.B \e0
+and
+.BI \ex NN
+for all other control characters, including 0x7F.
+With
+.BR \-\-raw ,
+the bytes are printed unchanged.
+.SH EXIT STATUS
+0 on success, 1 if the input cannot be parsed or is not ASCII, and 2 for
+invalid command line options.
+.SH EXAMPLES
+.nf
+$ ora-char "Typ=1 Len=5: 72,101,108,108,111"
+Hello
+$ ora-char 48656C6C6F
+Hello
+$ ora-char "col 0: [ 5] 48 65 6c 6c 6f"
+Hello
+$ ora-char \-f hex "Typ=1 Len=3: 61,62,63"
+abc
+$ ora-char \-v "Typ=96 Len=5: 104,105,32,32,32"
+type:     CHAR (Typ=96)
+format:   dec
+length:   5
+bytes:    68 69 20 20 20
+value:    "hi   "
+.fi
+.SH SEE ALSO
+.BR ora-num (1)
+.SH COPYRIGHT
+Copyright (c) 2026 Stefan Roesch
