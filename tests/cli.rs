@@ -270,6 +270,183 @@ fn reverse_errors() {
     );
 }
 
+#[test]
+fn reverse_options() {
+    ok(&["-r", "-f", "auto", "AB"], "41 42\n");
+    ok(&["-r", "--format=dec", "A"], "65\n");
+    let verbose = "value:    \"A\"\nlength:   1\ndump:     Typ=1 Len=1: 65\nbytes:    41\n";
+    ok(&["-rv", "A"], verbose);
+    ok(&["--verbose", "--reverse", "A"], verbose);
+    // Verbose output is the same for every format.
+    ok(&["-r", "-v", "-f", "dec", "A"], verbose);
+    ok(&["-r", "-v", "-f", "hex", "A"], verbose);
+    // --raw reads the text literally, the output is still escaped.
+    ok(
+        &["-r", "--raw", "-v", r"a\t"],
+        "value:    \"a\\\\t\"\nlength:   3\ndump:     Typ=1 Len=3: 97,92,116\nbytes:    61 5C 74\n",
+    );
+    ok(&["--raw", "-r", r"\"], "5C\n");
+    ok(&["-r", "--raw", "-f", "dec", r"\\"], "92,92\n");
+}
+
+#[test]
+fn reverse_usage_errors() {
+    // Missing text, extra text, a bad format and text that looks like an option.
+    for args in [
+        &["-r"][..],
+        &["-r", "a", "b"],
+        &["-r", "-f", "oct", "a"],
+        &["-r", "-x"],
+        &["-r", "--raw-text", "a"],
+    ] {
+        let (code, stdout, stderr) = run(args);
+        assert_eq!(code, 2, "{args:?}");
+        assert!(stdout.is_empty(), "{args:?}");
+        assert!(stderr.starts_with("error:"), "{args:?}: {stderr}");
+    }
+    // After "--", anything is text.
+    ok(&["-r", "--", "--raw"], "2D 2D 72 61 77\n");
+    ok(&["-r", "--", "-r"], "2D 72\n");
+}
+
+#[test]
+fn reverse_literal_text() {
+    ok(&["-r", "a b"], "61 20 62\n");
+    ok(&["-r", "   "], "20 20 20\n");
+    ok(&["-r", " "], "20\n");
+    ok(&["-r", "a\tb"], "61 09 62\n");
+    ok(
+        &["-r", "line1\nline2"],
+        "6C 69 6E 65 31 0A 6C 69 6E 65 32\n",
+    );
+    ok(&["-r", "\x7f"], "7F\n");
+    // Input that looks like another format is converted as text.
+    ok(&["-r", "NULL"], "4E 55 4C 4C\n");
+    ok(&["-r", "0x41"], "30 78 34 31\n");
+    ok(
+        &["-r", "-f", "dec", "Typ=1 Len=1: 65"],
+        "84,121,112,61,49,32,76,101,110,61,49,58,32,54,53\n",
+    );
+}
+
+#[test]
+fn reverse_inverts_forward() {
+    for hex in [
+        "48 65 6C 6C 6F",
+        "00 41 0A 5C 7F",
+        "09 0D 22 27 1B",
+        "20 20 20",
+    ] {
+        // The plain output of the forward conversion converts back.
+        let (code, text, stderr) = run(&["-f", "hex", hex]);
+        assert_eq!((code, stderr.as_str()), (0, ""), "{hex}");
+        ok(
+            &["-r", text.strip_suffix('\n').unwrap()],
+            &format!("{hex}\n"),
+        );
+        // So does the quoted value of the verbose output.
+        let (code, out, _) = run(&["-v", "-f", "hex", hex]);
+        assert_eq!(code, 0);
+        let value = out
+            .lines()
+            .last()
+            .unwrap()
+            .strip_prefix("value:    ")
+            .unwrap();
+        ok(&["-r", &value[1..value.len() - 1]], &format!("{hex}\n"));
+    }
+}
+
+#[test]
+fn reverse_more_errors() {
+    // Errors exit with 1 and print nothing on stdout, also with -v.
+    fails(
+        &["-r", "--raw", "Grüße"],
+        "character 3 ('ü') is not ASCII, only ASCII data is supported",
+    );
+    fails(
+        &["-r", "-v", "naïve"],
+        "character 3 ('ï') is not ASCII, only ASCII data is supported",
+    );
+    fails(
+        &["-r", "日本"],
+        "character 1 ('日') is not ASCII, only ASCII data is supported",
+    );
+    fails(
+        &["-r", "-f", "dec", "a\u{a0}b"],
+        "character 2 ('\u{a0}') is not ASCII, only ASCII data is supported",
+    );
+    for (text, seq) in [
+        (r"a\", r"\"),
+        (r"\x4", r"\x4"),
+        (r"\q", r"\q"),
+        (r"\X41", r"\X"),
+    ] {
+        fails(
+            &["-r", text],
+            &format!(
+                r"invalid escape sequence '{seq}', use \\ for a backslash or --raw to take the text literally"
+            ),
+        );
+    }
+    fails(
+        &["-r", r"AB\xFF"],
+        "byte 3 (0xFF) is not ASCII, only ASCII data is supported",
+    );
+    fails(
+        &["-r", "--raw", ""],
+        "the text is empty, Oracle stores an empty string as NULL",
+    );
+    fails(
+        &["-r", "-v", ""],
+        "the text is empty, Oracle stores an empty string as NULL",
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn reverse_write_error_exit_status() {
+    let full = std::fs::File::create("/dev/full").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_ora-char"))
+        .args(["-r", "AB"])
+        .stdout(full)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.starts_with("error: cannot write output: "),
+        "{stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn reverse_closed_pipe_is_not_an_error() {
+    // 100000 characters print as 300000 bytes, more than a pipe buffer.
+    let input = "A".repeat(100000);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ora-char"))
+        .args(["-r", &input])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let mut first = [0u8; 6];
+    stdout.read_exact(&mut first).unwrap();
+    assert_eq!(&first, b"41 41 ");
+    drop(stdout);
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert_eq!(child.wait().unwrap().code(), Some(0));
+    assert_eq!(stderr, "");
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn write_error_exit_status() {

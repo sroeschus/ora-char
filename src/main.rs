@@ -1349,6 +1349,190 @@ mod tests {
     }
 
     #[test]
+    fn reverse_escape_edges() {
+        let enc = |t| encode_text(t, false);
+        let bad = |seq: &str| Err(Error::BadEscape(seq.into()));
+        // \0 is a single NUL byte, not the start of an octal escape.
+        assert_eq!(enc(r"\012"), Ok(b"\x0012".to_vec()));
+        // \x takes exactly two hex digits.
+        assert_eq!(enc(r"\x414"), Ok(b"A4".to_vec()));
+        assert_eq!(enc(r"\x00\x0a"), Ok(vec![0, 0x0A]));
+        // An escaped backslash does not start a new escape.
+        assert_eq!(enc(r"\\n"), Ok(br"\n".to_vec()));
+        assert_eq!(enc(r"\\\\"), Ok(br"\\".to_vec()));
+        assert_eq!(enc(r"\\\t"), Ok(b"\\\t".to_vec()));
+        // Escapes alone, at the start and at the end.
+        assert_eq!(enc(r"\t"), Ok(b"\t".to_vec()));
+        assert_eq!(enc(r"\tx\t"), Ok(b"\tx\t".to_vec()));
+        // Escape letters are case-sensitive.
+        for seq in [r"\N", r"\T", r"\R", r"\X"] {
+            assert_eq!(encode_text(&format!("{seq}41"), false), bad(seq), "{seq}");
+        }
+        // Escapes known from other languages are not accepted.
+        for seq in [
+            r"\a", r"\b", r"\e", r"\f", r"\v", r"\'", r"\ ", r"\u", r"\1",
+        ] {
+            assert_eq!(enc(seq), bad(seq), "{seq}");
+        }
+        // A backslash before a non-ASCII character is an invalid escape.
+        assert_eq!(enc(r"\ä"), bad(r"\ä"));
+        // The first problem is reported.
+        assert_eq!(enc(r"\q\x80"), bad(r"\q"));
+        assert_eq!(enc(r"\x80\q"), Err(Error::NotAscii { pos: 1, byte: 0x80 }));
+        assert_eq!(enc(r"ä\q"), Err(Error::NotAsciiChar { pos: 1, ch: 'ä' }));
+    }
+
+    #[test]
+    fn reverse_error_positions() {
+        let enc = |t| encode_text(t, false);
+        // A non-ASCII character is reported by its position in the input,
+        // counting escape sequences character by character.
+        assert_eq!(
+            enc(r"\t\x41ä"),
+            Err(Error::NotAsciiChar { pos: 7, ch: 'ä' })
+        );
+        // A multi-byte character counts as one.
+        assert_eq!(enc("ab€"), Err(Error::NotAsciiChar { pos: 3, ch: '€' }));
+        assert_eq!(enc("€ä"), Err(Error::NotAsciiChar { pos: 1, ch: '€' }));
+        assert_eq!(enc("日本"), Err(Error::NotAsciiChar { pos: 1, ch: '日' }));
+        // A \xNN byte is reported by its position in the resulting bytes.
+        assert_eq!(
+            enc(r"\t\x41\x80"),
+            Err(Error::NotAscii { pos: 3, byte: 0x80 })
+        );
+        // With --raw the backslash is an ordinary character.
+        assert_eq!(
+            encode_text(r"\tä", true),
+            Err(Error::NotAsciiChar { pos: 3, ch: 'ä' })
+        );
+    }
+
+    #[test]
+    fn reverse_literal_text() {
+        for raw in [false, true] {
+            // Control characters and whitespace typed literally are kept.
+            for text in ["a\tb\nc\r\0\x7f", "   ", " a ", "\n"] {
+                assert_eq!(encode_text(text, raw), Ok(text.as_bytes().to_vec()));
+            }
+            // Text that looks like another input format is still text.
+            for text in [
+                "Typ=1 Len=3: 97,98,99",
+                "NULL",
+                "0x41",
+                "41",
+                "col 0: [ 1] 41",
+                "col 1: *NULL*",
+            ] {
+                assert_eq!(encode_text(text, raw), Ok(text.as_bytes().to_vec()));
+            }
+        }
+        // Every ASCII character other than the backslash maps to itself.
+        let all: String = (0u8..0x80)
+            .filter(|&b| b != b'\\')
+            .map(char::from)
+            .collect();
+        assert_eq!(encode_text(&all, false), Ok(all.as_bytes().to_vec()));
+        // With --raw, every ASCII character does.
+        let all: String = (0u8..0x80).map(char::from).collect();
+        assert_eq!(encode_text(&all, true), Ok(all.as_bytes().to_vec()));
+    }
+
+    #[test]
+    fn reverse_output_variants() {
+        // A single byte.
+        assert_eq!(rev("A", Format::Hex, false), "41\n");
+        assert_eq!(rev("A", Format::Dec, false), "65\n");
+        // Hex is upper case and zero-padded; decimal has no padding.
+        assert_eq!(rev(r"\x00\x0a\x7f", Format::Hex, false), "00 0A 7F\n");
+        assert_eq!(rev(r"\x00\x0a\x7f", Format::Dec, false), "0,10,127\n");
+        // In verbose output, the value is quoted and escaped.
+        assert_eq!(
+            rev(r#"a"b\t\\"#, Format::Auto, true),
+            "value:    \"a\\\"b\\t\\\\\"\n\
+             length:   5\n\
+             dump:     Typ=1 Len=5: 97,34,98,9,92\n\
+             bytes:    61 22 62 09 5C\n"
+        );
+        // --raw only changes how the input is read, not the output.
+        let mut out = Vec::new();
+        let args = Args {
+            input: String::new(),
+            reverse: true,
+            format: Format::Auto,
+            raw: true,
+            verbose: true,
+        };
+        write_reverse(&mut out, br"a\t", &args).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "value:    \"a\\\\t\"\n\
+             length:   3\n\
+             dump:     Typ=1 Len=3: 97,92,116\n\
+             bytes:    61 5C 74\n"
+        );
+        // A VARCHAR2 at its standard maximum of 4000 bytes.
+        let text = "x".repeat(4000);
+        let hex = rev(&text, Format::Hex, false);
+        assert_eq!(hex, format!("{}78\n", "78 ".repeat(3999)));
+        let dec = rev(&text, Format::Dec, false);
+        assert_eq!(dec, format!("{}120\n", "120,".repeat(3999)));
+        assert!(
+            rev(&text, Format::Auto, true)
+                .contains("\nlength:   4000\ndump:     Typ=1 Len=4000: 120,")
+        );
+    }
+
+    #[test]
+    fn reverse_write_errors() {
+        for format in [Format::Auto, Format::Dec, Format::Hex] {
+            for verbose in [false, true] {
+                let args = Args {
+                    input: String::new(),
+                    reverse: true,
+                    format,
+                    raw: false,
+                    verbose,
+                };
+                let mut out = FailingWriter(io::ErrorKind::StorageFull);
+                let result = write_reverse(&mut out, b"AB", &args);
+                assert_eq!(
+                    result.map_err(|e| e.kind()),
+                    Err(io::ErrorKind::StorageFull),
+                    "format={format} verbose={verbose}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reverse_inverts_forward() {
+        // The plain and the verbose (quoted) output of the forward conversion
+        // both convert back to the original bytes.
+        for hex in [
+            "48656C6C6F",
+            "00410A5C7F",
+            "090D22271B",
+            "202020",
+            "5C5C78343122",
+        ] {
+            let bytes = parse_input(hex, Format::Hex).unwrap().bytes;
+            assert_eq!(
+                encode_text(&escape(&bytes, false), false),
+                Ok(bytes.clone())
+            );
+            let out = verbose(hex, Format::Hex, false);
+            let value = out
+                .lines()
+                .last()
+                .unwrap()
+                .strip_prefix("value:    ")
+                .unwrap();
+            let unquoted = &value[1..value.len() - 1];
+            assert_eq!(encode_text(unquoted, false), Ok(bytes), "{hex}");
+        }
+    }
+
+    #[test]
     fn error_messages() {
         for (error, text) in [
             (Error::Empty, "no bytes given"),
