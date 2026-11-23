@@ -179,18 +179,30 @@ invalid command line options.
 .nf
 $ ora-char "Typ=1 Len=5: 72,101,108,108,111"
 Hello
+.sp
 $ ora-char 48656C6C6F
 Hello
+.sp
 $ ora-char "col 0: [ 5] 48 65 6c 6c 6f"
 Hello
+.sp
 $ ora-char \-f hex "Typ=1 Len=3: 61,62,63"
 abc
+.sp
 $ ora-char \-v "Typ=96 Len=5: 104,105,32,32,32"
 type:     CHAR (Typ=96)
 format:   dec
 length:   5
 bytes:    68 69 20 20 20
 value:    "hi   "
+.sp
+$ ora-char \-v "Typ=1 Len=5 CharacterSet=AL32UTF8: 48,65,6c,6c,6f"
+type:     VARCHAR2 (Typ=1)
+charset:  AL32UTF8
+format:   hex
+length:   5
+bytes:    48 65 6C 6C 6F
+value:    "Hello"
 .fi
 .SH SEE ALSO
 .BR ora-num (1)
